@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+*.zip
+build/
+.secrets/
+XSecrets.h
+__pycache__/
