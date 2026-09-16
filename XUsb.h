@@ -6,4 +6,5 @@ namespace XUsb {
   void log(const char* format, ...) __attribute__((format(printf, 1, 2)));
   void poll(CommandHandler handler);
   void replay();
+  void drain();
 }

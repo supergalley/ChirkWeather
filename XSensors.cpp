@@ -45,20 +45,40 @@ static uint8_t mapVaneCode(uint16_t raw){
 }
 
 namespace XSensors{
-  void begin(){
-    errorText[0]='\0';
+  void beginADC(){
     pinMode(PIN_ADC_CTRL,OUTPUT);
     digitalWrite(PIN_ADC_CTRL,LOW);
     analogReadResolution(12);
     analogSetPinAttenuation(PIN_ANEM,ADC_11db);
     analogSetPinAttenuation(PIN_VANE,ADC_11db);
     analogSetPinAttenuation(PIN_BATTERY_ADC,ADC_11db);
+  }
+  void begin(){
+    errorText[0]=0;
+    beginADC();
     BME_I2C.begin(PIN_BME_SDA,PIN_BME_SCL,400000);
     BME_I2C.setTimeOut(50);
     if(bme.begin(0x76,&BME_I2C)){bmeOK=true;return;}
     if(bme.begin(0x77,&BME_I2C)){bmeOK=true;return;}
     bmeOK=false;
     strcpy(errorText,"BME280 not found");
+  }
+  void readBattery(uint16_t &raw,float &volts){
+    digitalWrite(PIN_ADC_CTRL,HIGH);
+    delay(10);
+    (void)analogReadMilliVolts(PIN_BATTERY_ADC);
+    uint32_t sumRaw=0,sumMv=0;
+    for(unsigned i=0;i<16;++i){
+      sumRaw+=analogRead(PIN_BATTERY_ADC);
+      sumMv+=analogReadMilliVolts(PIN_BATTERY_ADC);
+      delay(1);
+    }
+    digitalWrite(PIN_ADC_CTRL,LOW);
+    raw=sumRaw/16;
+    volts=(sumMv/16000.0f)*4.55f;
+  }
+  void sleep(){
+    if(bmeOK) bme.setSampling(Adafruit_BME280::MODE_SLEEP);
   }
   bool read(XReadings &r){
     bool ok=true;
@@ -80,13 +100,7 @@ namespace XSensors{
     float vVIn=adcToVolts(vCounts)*DIV_K;
     r.vaneSensorV=vVIn;
     r.windDirCode=mapVaneCode(vCounts);
-    digitalWrite(PIN_ADC_CTRL,HIGH);
-    delay(10);
-    uint16_t bCounts=readADCoversample(PIN_BATTERY_ADC,16);
-    int bMv=analogReadMilliVolts(PIN_BATTERY_ADC);
-    digitalWrite(PIN_ADC_CTRL,LOW);
-    r.batteryRaw=bCounts;
-    r.batteryV=(bMv/1000.0f)*4.55f;
+    readBattery(r.batteryRaw,r.batteryV);
     if(bmeOK){
       r.tempC=bme.readTemperature();
       r.humidity=bme.readHumidity();

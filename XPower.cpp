@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "XPins.h"
 #include "XPower.h"
+#include <driver/gpio.h>
 namespace { bool enabled = false; }
 namespace XPower {
 bool converterAvailable() {
@@ -11,6 +12,16 @@ bool converterAvailable() {
 #endif
 }
 void begin() {
+  // Set the desired output latches before releasing sleep holds, avoiding an ON pulse.
+  if(converterAvailable()){
+    digitalWrite(PIN_12V_EN,LOW);pinMode(PIN_12V_EN,OUTPUT);
+  }
+  digitalWrite(PIN_VEXT,HIGH);pinMode(PIN_VEXT,OUTPUT);
+  digitalWrite(PIN_ADC_CTRL,LOW);pinMode(PIN_ADC_CTRL,OUTPUT);
+  gpio_deep_sleep_hold_dis();
+  if(converterAvailable()) gpio_hold_dis((gpio_num_t)PIN_12V_EN);
+  gpio_hold_dis((gpio_num_t)PIN_VEXT);
+  gpio_hold_dis((gpio_num_t)PIN_ADC_CTRL);
   if (!converterAvailable()) return;
   digitalWrite(PIN_12V_EN, LOW);
   pinMode(PIN_12V_EN, OUTPUT);
@@ -20,6 +31,15 @@ bool setConverter(bool on) {
   digitalWrite(PIN_12V_EN, on ? HIGH : LOW);
   enabled = on;
   return true;
+}
+void prepareSleep(){
+  setConverter(false);
+  pinMode(PIN_VEXT,OUTPUT);digitalWrite(PIN_VEXT,HIGH);
+  pinMode(PIN_ADC_CTRL,OUTPUT);digitalWrite(PIN_ADC_CTRL,LOW);
+  if(converterAvailable()) gpio_hold_en((gpio_num_t)PIN_12V_EN);
+  gpio_hold_en((gpio_num_t)PIN_VEXT);
+  gpio_hold_en((gpio_num_t)PIN_ADC_CTRL);
+  gpio_deep_sleep_hold_en();
 }
 bool converterOn() { return enabled; }
 int converterPinLevel() { return converterAvailable() ? digitalRead(PIN_12V_EN) : -1; }

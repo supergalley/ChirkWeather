@@ -15,9 +15,11 @@ bool overflow = false;
 }
 namespace XUsb {
 void begin() {
-  Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
   Serial.setRxBufferSize(1024);
+#endif
+  Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
   Serial.setTxTimeoutMs(0);
 #endif
 }
@@ -37,7 +39,7 @@ void replay() {
   nextOutput = sequence > 32 ? sequence - 32 : 0;
   outputOffset = 0;
 }
-void poll(CommandHandler handler) {
+void drain() {
   // A disconnected or slow USB host must never hold up the radio or sensors.
   if (Serial && nextOutput != sequence) {
     if (sequence - nextOutput > capacity) {
@@ -53,6 +55,9 @@ void poll(CommandHandler handler) {
       if (outputOffset == strlen(line)) { ++nextOutput; outputOffset = 0; }
     }
   }
+}
+void poll(CommandHandler handler) {
+  drain();
   // Bounded work per poll; accept CR, LF, or CRLF. Never execute a truncated command.
   for (unsigned n = 0; n < 96 && Serial.available(); ++n) {
     char c = Serial.read();

@@ -33,6 +33,8 @@
 #include "XRadio.h"
 #include "XPower.h"
 #include "XUsb.h"
+#include "XPolicy.h"
+#include "XHealth.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include <ctype.h>
@@ -41,16 +43,17 @@
 
 XReadings readings={};
 uint8_t payload[4]={};
-bool diagnosticMode=true; // Cold boots/resets always enter USB diagnostics.
+bool diagnosticMode=false; // Production default. Enter diagnostics explicitly during the boot window.
 constexpr uint32_t sensorWarmupMs=5000;
-constexpr uint64_t normalSleepUs=10ULL*60ULL*1000000ULL;
-constexpr uint32_t minimumTxIntervalMs=120000;
-RTC_DATA_ATTR uint32_t normalResumeCookie=0;
-constexpr uint32_t normalCookie=0x4348524B;
+constexpr uint32_t minimumTxIntervalMs=XPolicy::normalSeconds*1000UL;
+RTC_DATA_ATTR bool lowBatteryLatched=false;
+uint32_t requestedSleepSeconds=XPolicy::normalSeconds;
+bool sensorsStarted=false;
+uint32_t diagnosticTxNotBefore=0;
 bool sampleValid=false, warming=false, sendAfterSample=false;
 bool autoTransmit=true, txAttempted=false, oledBlanked=false;
 uint32_t warmupStarted=0, lastSample=0, lastTx=0, nextAutomatic=0;
-uint32_t diagCycleMs=120000, streamMs=5000, lastStream=0;
+uint32_t diagCycleMs=600000, streamMs=5000, lastStream=0;
 bool lastButton=HIGH, stableButton=HIGH;
 uint32_t buttonChanged=0;
 const char* phase="starting";
@@ -107,6 +110,10 @@ void sampleNow(){
   reportReadings();
 }
 bool txAllowed(){
+  if((int32_t)(millis()-diagnosticTxNotBefore)<0){
+    XUsb::log("TX recovery holdoff: wait %lu seconds",(unsigned long)((diagnosticTxNotBefore-millis()+999)/1000));
+    return false;
+  }
   if(txAttempted && millis()-lastTx<minimumTxIntervalMs){
     XUsb::log("TX deferred: wait %lu seconds",(minimumTxIntervalMs-(millis()-lastTx)+999)/1000);
     return false;
@@ -124,7 +131,9 @@ void transmit(){
   XUsb::log("CYCLE radio_ready=%u result=%d detail=%s",ready,result,XRadio::status());
   phase="idle";
   displayStatus(result>=0?"TX local OK":"TX failed; USB logs");
-  nextAutomatic=millis()+diagCycleMs;
+  uint32_t quietMs=XRadio::sleepSeconds()*1000UL;
+  diagnosticTxNotBefore=millis()+quietMs;
+  nextAutomatic=millis()+(quietMs>diagCycleMs?quietMs:diagCycleMs);
 }
 void startMeasurement(bool thenSend){
   if(warming){XUsb::log("ERROR measurement already warming; use cancel");return;}
@@ -137,10 +146,10 @@ void startMeasurement(bool thenSend){
 void help(){
   XUsb::log("COMMANDS: help | status | pins | read | sample | radio | tx | cancel | logs");
   XUsb::log("POWER: boost on | boost off | oled on | oled off (blanks display; keeps Vext powered)");
-  XUsb::log("CONTROL: auto on|off | interval 120..3600 (seconds) | stream 0..3600 (0=off)");
+  XUsb::log("CONTROL: auto on|off | interval 600..3600 (seconds) | stream 0..3600 (0=off)");
   XUsb::log("SERVICE: sensors retry | mode normal | mode diagnostic | reboot");
   XUsb::log("read=5-second warm-up then sample; sample=immediate; tx=fresh sample then unconfirmed uplink");
-  XUsb::log("TX is limited to one attempt per 120 seconds; success is local, not proof of TTN acceptance");
+  XUsb::log("TX is limited to one attempt per 600 seconds (or longer for airtime); success is local, not proof of TTN acceptance");
   XUsb::log("USB commands queue during radio TX/RX; recent logs are retained in RAM, never keys");
 }
 bool secondsArgument(const char* text,uint32_t low,uint32_t high,uint32_t& output){
@@ -150,33 +159,60 @@ bool secondsArgument(const char* text,uint32_t low,uint32_t high,uint32_t& outpu
   if(*end || value<low || value>high) return false;
   output=(uint32_t)value*1000;return true;
 }
+void drainBriefly(){
+  uint32_t start=millis();
+  while(millis()-start<80){XUsb::drain();delay(1);}
+}
+void enterDiagnostic(){
+  diagnosticMode=true;
+  XOLED::powerUp();
+  XPower::setConverter(true);
+  XUsb::log("MODE diagnostic explicitly requested; battery sleep bypassed");
+}
+void bootCommand(const char* cmd){
+  if(!strcmp(cmd,"mode diagnostic")) enterDiagnostic();
+  else XUsb::log("BOOT: send 'mode diagnostic' or press PROG after RESET to stay awake");
+}
 void sleepNormal(){
   XPower::setConverter(false);
-  normalResumeCookie=normalCookie;
-  XUsb::log("SLEEP normal cycle: ten minutes; USB unavailable until wake/reset");
+  if(sensorsStarted) XSensors::sleep();
+  XRadio::sleep();
   XOLED::powerDown();
-  esp_sleep_enable_timer_wakeup(normalSleepUs);
+  XPower::prepareSleep();
+  uint32_t quiet=XRadio::sleepSeconds();
+  if(requestedSleepSeconds<quiet) requestedSleepSeconds=quiet;
+  XUsb::log("SLEEP seconds=%lu low_battery=%u; converter/OLED/radio off",(unsigned long)requestedSleepSeconds,lowBatteryLatched);
+  drainBriefly();
+  XHealth::beforeSleep();
+  esp_sleep_enable_timer_wakeup((uint64_t)requestedSleepSeconds*1000000ULL);
   esp_deep_sleep_start();
 }
 void normalCycle(){
   phase="normal battery check";
   XPower::setConverter(false);
-  sampleNow();
-  uint8_t batt=(payload[3]>>4)&7;
-  if(batt<2){XUsb::log("BATTERY below calculated 3.62 V threshold; sleep");sleepNormal();}
+  XSensors::readBattery(readings.batteryRaw,readings.batteryV);
+  lowBatteryLatched=XPolicy::batteryLow(readings.batteryV,lowBatteryLatched);
+  XUsb::log("BATTERY measured_V=%.3f raw=%u low_latched=%u",readings.batteryV,readings.batteryRaw,lowBatteryLatched);
+  XHealth::feed();
+  if(lowBatteryLatched){requestedSleepSeconds=XPolicy::lowBatterySeconds;sleepNormal();}
+  if(!sensorsStarted){
+    XUsb::log("BOOT BME280 initialization starting");drainBriefly();
+    XSensors::begin();sensorsStarted=true;XHealth::feed();
+  }
   XPower::setConverter(true);
   uint32_t started=millis();
   while(millis()-started<sensorWarmupMs){
-    if(buttonPressed()){
-      diagnosticMode=true;normalResumeCookie=0;XOLED::powerUp();
-      XUsb::log("MODE diagnostic via PROG");
-      break;
-    }
-    delay(10);
+    if(buttonPressed()) enterDiagnostic();
+    XUsb::poll(bootCommand);
+    XHealth::feed();delay(10);
   }
-  sampleNow();
+  sampleNow();XHealth::feed();
+  // Check loaded voltage as well; converter start-up can reveal a weak battery.
+  if(!diagnosticMode && XPolicy::batteryLow(readings.batteryV,false)){
+    lowBatteryLatched=true;requestedSleepSeconds=XPolicy::lowBatterySeconds;sleepNormal();
+  }
   if(!diagnosticMode) XPower::setConverter(false);
-  transmit();
+  transmit();XHealth::feed();
   if(!diagnosticMode) sleepNormal();
 }
 void commandReceived(const char* input){
@@ -226,8 +262,8 @@ void commandReceived(const char* input){
     XUsb::log("OK automatic uplinks %s",autoTransmit?"on":"off");
   }
   else if(!strncmp(cmd,"interval ",9)){
-    if(secondsArgument(cmd+9,120,3600,diagCycleMs)){nextAutomatic=millis()+diagCycleMs;XUsb::log("OK interval_s=%lu",(unsigned long)(diagCycleMs/1000));}
-    else XUsb::log("ERROR interval must be a whole number 120..3600 seconds");
+    if(secondsArgument(cmd+9,600,3600,diagCycleMs)){nextAutomatic=millis()+diagCycleMs;XUsb::log("OK interval_s=%lu",(unsigned long)(diagCycleMs/1000));}
+    else XUsb::log("ERROR interval must be a whole number 600..3600 seconds");
   }
   else if(!strncmp(cmd,"stream ",7)){
     if(secondsArgument(cmd+7,0,3600,streamMs)){lastStream=millis();XUsb::log("OK stream_s=%lu (cached readings; use read for a fresh sample)",(unsigned long)(streamMs/1000));}
@@ -235,38 +271,54 @@ void commandReceived(const char* input){
   }
   else if(!strcmp(cmd,"sensors retry")){
     if(warming) XUsb::log("ERROR warming; wait or cancel");
-    else{XSensors::begin();sampleNow();displayStatus("Sensors retried");}
+    else{XSensors::begin();sensorsStarted=true;sampleNow();displayStatus("Sensors retried");}
   }
   else if(!strcmp(cmd,"mode diagnostic")){XUsb::log("OK already in diagnostic mode; no automatic sleep");}
   else if(!strcmp(cmd,"mode normal")){
     if(!XPower::converterAvailable()){XUsb::log("ERROR fix converter/USB pin conflict before normal operation");return;}
-    warming=false;sendAfterSample=false;diagnosticMode=false;normalCycle();
+    warming=false;sendAfterSample=false;diagnosticMode=false;sleepNormal();
   }
   else if(!strcmp(cmd,"reboot")){
-    XPower::setConverter(false);normalResumeCookie=0;ESP.restart();
+    XPower::setConverter(false);ESP.restart();
   }
   else XUsb::log("ERROR unknown command; use help");
 }
 void setup(){
   XUsb::begin();
-  pinMode(PIN_BUTTON,INPUT_PULLUP);
   XPower::begin();
-  diagnosticMode=!(esp_sleep_get_wakeup_cause()==ESP_SLEEP_WAKEUP_TIMER && normalResumeCookie==normalCookie);
-  XUsb::log("BOOT ChirkWeather USB diagnostics v1 board=Heltec-V4 compiled=" __DATE__ " " __TIME__);
-  XUsb::log("BOOT reset=%d wake=%d native_USB=%d",(int)esp_reset_reason(),(int)esp_sleep_get_wakeup_cause(),ARDUINO_USB_CDC_ON_BOOT);
-  if(diagnosticMode){
-    XOLED::powerUp();
-    XPower::setConverter(true); // Stay on throughout diagnostics, unless explicitly switched off.
-    if(!XPower::converterAvailable()) XUsb::log("ERROR converter GPIO%d conflicts with USB; converter control disabled",PIN_12V_EN);
-    displayStatus("Starting sensors");
-  }else{pinMode(PIN_VEXT,OUTPUT);digitalWrite(PIN_VEXT,HIGH);}
-  XSensors::begin();
-  if(!diagnosticMode){normalCycle();return;}
+  pinMode(PIN_BUTTON,INPUT_PULLUP);
+  pinMode(PIN_VEXT,OUTPUT);digitalWrite(PIN_VEXT,HIGH);
+  XHealth::begin();
+  XSensors::beginADC();
+  XUsb::log("BOOT ChirkWeather production v2 compiled=" __DATE__ " " __TIME__);
+  XUsb::log("BOOT reset=%d wake=%d; normal minimum interval=600 seconds; PROG/USB diagnostic entry available",
+    (int)esp_reset_reason(),(int)esp_sleep_get_wakeup_cause());
+  requestedSleepSeconds=XRadio::recoverySeconds();
+  bool timerWake=(esp_sleep_get_wakeup_cause()==ESP_SLEEP_WAKEUP_TIMER);
+  diagnosticTxNotBefore=timerWake?0:millis()+requestedSleepSeconds*1000UL;
+  uint32_t started=millis();
+  // A short grace window on every wake; never wait indefinitely for a USB host.
+  while(millis()-started<3000 && !diagnosticMode){
+    if(buttonPressed()) enterDiagnostic();
+    XUsb::poll(bootCommand);XHealth::feed();delay(5);
+  }
+  if(!diagnosticMode){
+    // On power-on, reset, brownout or watchdog recovery, wait a full interval before TX.
+    // This prevents reboot loops or repeated resets from flooding the network.
+    if(!timerWake){XUsb::log("RECOVERY holdoff before first transmission");sleepNormal();}
+    normalCycle();
+    if(!diagnosticMode) return;
+  }
+  if(!sensorsStarted){
+    XUsb::log("BOOT BME280 initialization starting");drainBriefly();
+    XSensors::begin();sensorsStarted=true;XHealth::feed();
+  }
   phase="idle";
-  nextAutomatic=millis()+10000; // Time to connect and disable automatic transmissions if desired.
+  nextAutomatic=millis()+diagCycleMs;
   help();reportStatus();displayStatus("USB ready; type help");
 }
 void loop(){
+  XHealth::feed();
   if(!diagnosticMode){sleepNormal();return;}
   XUsb::poll(commandReceived);
   if(buttonPressed()) {reportStatus();displayStatus("USB diagnostics");}

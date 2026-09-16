@@ -11,3 +11,7 @@ for pin in 19 47; do
     "$project_dir/XPower.cpp" "$project_dir/XanderByte.cpp" -o "$test_dir/test-$pin"
   "$test_dir/test-$pin"
 done
+c++ -std=c++17 -fsanitize=address,undefined -g \
+  -I"$project_dir/tests/radio_stubs" -I"$project_dir/tests/stubs" -I"$project_dir" \
+  "$project_dir/tests/radio_test.cpp" -o "$test_dir/radio"
+"$test_dir/radio"

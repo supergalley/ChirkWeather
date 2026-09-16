@@ -1,3 +1,6 @@
+// Historical Heltec-stack implementation, unused by this RadioLib firmware.
+// Keep disabled: its driver/gpio.h shadows the ESP-IDF GPIO sleep API.
+#if 0
 #include "XCredentials.h"
 #include "XLoRa.h"
 #include "LoRaWan_APP.h"
@@ -87,3 +90,4 @@ namespace XLoRa{
     for(uint8_t i=0;i<len;i++) txPayload[i]=data[i];
   }
 }
+#endif
